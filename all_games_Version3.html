@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>All Games — HappyCatch Collection (All-in-One)</title>
+  <style>
+    :root{--bg:#f7fbff;--brand:#ff7aa2;--muted:#6b7c93;--text:#183048}
+    *{box-sizing:border-box}html,body{height:100%;margin:0;font-family:Inter,Helvetica,Arial,sans-serif;background:linear-gradient(180deg,#eaf8ff,#f7fbff);color:var(--text)}
+    .wrap{max-width:520px;margin:12px auto;padding:12px}
+    header{text-align:center}
+    header h1{margin:6px 0}
+    .hud{display:flex;justify-content:center;gap:12px;margin-top:6px;font-weight:700}
+    nav#modes{display:flex;gap:6px;justify-content:center;margin:12px 0}
+    nav#modes button{background:#fff;color:var(--brand);padding:6px 10px;border-radius:8px;border:2px solid #ffd9e6;font-weight:700}
+    nav#modes button.active{background:var(--brand);color:#fff;border-color:var(--brand)}
+    #gameWrap{display:flex;justify-content:center}
+    canvas{width:100%;max-width:480px;height:640px;background:linear-gradient(180deg,#cfefff,#9fd8ff);border-radius:12px;display:block;touch-action:none}
+    .controls{display:flex;gap:8px;justify-content:center;margin-top:8px}
+    button{background:var(--brand);color:#fff;border:none;padding:8px 12px;border-radius:10px;font-weight:700}
+    .small{font-size:0.9rem;color:var(--muted)}
+    .panel{margin-top:10px;background:rgba(255,255,255,0.6);padding:10px;border-radius:10px}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>HappyCatch — All-in-One</h1>
+      <div class="small">Catch / Memory / Rhythm — Tek sayfada test etmek için</div>
+      <div class="hud"><span id="score">Skor: 0</span><span id="coins">Coin: 0</span></div>
+    </header>
+
+    <nav id="modes">
+      <button data-mode="catch" class="active">Catch</button>
+      <button data-mode="memory">Memory</button>
+      <button data-mode="rhythm">Rhythm</button>
+    </nav>
+
+    <div id="gameWrap">
+      <canvas id="game" width="480" height="640"></canvas>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn">Başlat</button>
+      <button id="storeBtn">Mağaza</button>
+      <button id="dailyBtn">Günlük Ödül</button>
+    </div>
+
+    <div class="panel">
+      <div class="small">Notlar: Oyunlar localStorage ile ilerlemeyi tutar. Mobilde ses için canvas'e dokunmanız gerekebilir.</div>
+    </div>
+  </div>
+
+  <!-- Panel / modal -->
+  <div id="overlay" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,0.45)"></div>
+  <div id="panel" class="hidden" style="position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:92%;max-width:420px;background:#fff;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,0.2)">
+    <button id="closePanel" style="float:right;background:#eee;color:#333;border:none;padding:6px 8px;border-radius:8px">Kapat</button>
+    <div id="panelContent" style="margin-top:8px"></div>
+  </div>
+
+  <script>
+  // All-in-one game (Catch / Memory / Rhythm)
+  (function(){
+    const canvas = document.getElementById('game'), ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('startBtn'), storeBtn = document.getElementById('storeBtn'), dailyBtn = document.getElementById('dailyBtn');
+    const scoreEl = document.getElementById('score'), coinsEl = document.getElementById('coins');
+    const modes = document.querySelectorAll('#modes button');
+    const overlay = document.getElementById('overlay'), panel = document.getElementById('panel'), panelContent = document.getElementById('panelContent'), closePanel = document.getElementById('closePanel');
+
+    // persistent save
+    const KEY = 'happy_all_v1';
+    const defaultSave = { coins:0, purchased:[], lastDaily:null, streak:0 };
+    let save = loadSave();
+    function loadSave(){ try{ return JSON.parse(localStorage.getItem(KEY)) || JSON.parse(JSON.stringify(defaultSave)); }catch(e){ return JSON.parse(JSON.stringify(defaultSave)); } }
+    function saveNow(){ localStorage.setItem(KEY, JSON.stringify(save)); updateHUD(); }
+
+    // state
+    let mode = 'catch';
+    let running = false;
+    let items = [], particles = [], score = 0, coins = save.coins || 0, combo = 0, tick = 0;
+
+    // Balance
+    const BAL = { spawnBase: 0.02, spawnScale: 0.0006, rareRate: 0.03, starRate: 0.08, bombRate: 0.07 };
+
+    // UI mode switch
+    modes.forEach(b => b.addEventListener('click', () => {
+      modes.forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      mode = b.dataset.mode;
+      stopSession();
+      resetSession();
+    }));
+
+    // resize handling (canvas uses fixed logical size)
+    function fit(){ canvas.width = 480; canvas.height = 640; } fit();
+    window.addEventListener('resize', fit);
+
+    // simple audio unlock
+    let audioCtx=null;
+    function ensureAudio(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    function sfx(freq=800,t=0.05,g=0.06){ if(!audioCtx) return; const o=audioCtx.createOscillator(), gr=audioCtx.createGain(); o.type='sine'; o.frequency.value=freq; gr.gain.value=g; o.connect(gr); gr.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+t); }
+
+    // --- Catch mode helpers ---
+    const TYPES = { coin:{col:'#ffd166',score:1,coin:1}, star:{col:'#ffef96',score:5,coin:3}, bomb:{col:'#ff6b6b',score:0,coin:0}, rare:{col:'#9b5cff',score:20,coin:10} };
+    function spawnItem() {
+      const r = Math.random();
+      let type='coin';
+      if (r < BAL.rareRate) type='rare';
+      else if (r < BAL.rareRate + BAL.starRate) type='star';
+      else if (r < BAL.rareRate + BAL.starRate + BAL.bombRate) type='bomb';
+      const size = (type==='rare'?36:(type==='star'?28:(type==='bomb'?30:22)));
+      items.push({ x: Math.random()*(canvas.width-80)+40, y:-size, vy:1.0+Math.random()*1.5, size, type, age:0 });
+    }
+
+    // --- Memory helpers ---
+    let memBoard=[], memCols=4, memRows=3, memRevealed=[], memPairs=0, memActive=false;
+    function startMemory() {
+      memBoard=[]; memPairs=0; memActive=true;
+      const total = memCols*memRows; const pairs = total/2;
+      let vals=[]; for(let i=0;i<pairs;i++){ vals.push(i); vals.push(i); }
+      for(let i=vals.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [vals[i],vals[j]]=[vals[j],vals[i]]; }
+      for(let r=0;r<memRows;r++){ for(let c=0;c<memCols;c++){ memBoard.push({val: vals[r*memCols+c], revealed:false, x:c, y:r}); } }
+      memRevealed=[];
+    }
+
+    // --- Rhythm helpers ---
+    let rhythmNotes=[], rhythmLanes=3, rhythmActive=false, rhythmTimer=0, rhythmScore=0;
+    function startRhythm() { rhythmNotes=[]; rhythmActive=true; rhythmTimer=0; rhythmScore=0; for(let t=1;t<30;t+=0.6){ rhythmNotes.push({t, lane: Math.floor(Math.random()*rhythmLanes), hit:false}); } }
+
+    // generic particles
+    function spawnParticles(x,y,col,count=12){
+      for(let i=0;i<count;i++) particles.push({x,y,vx:(Math.random()-0.5)*6,vy:(Math.random()-1.5)*3,r:Math.random()*3+1.2,life:Math.random()*25+18,col});
+    }
+
+    // update loop
+    function update(dt) {
+      if (running && mode === 'catch') {
+        if (Math.random() < BAL.spawnBase + Math.min(0.2, score * BAL.spawnScale)) spawnItem();
+      }
+      items.forEach(it=>{ it.y += it.vy * dt * 60; it.age += dt; });
+      items = items.filter(it=> it.y < canvas.height + 60 );
+      for(let i=particles.length-1;i>=0;i--){ const p=particles[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=0.06; p.life--; if(p.life<=0) particles.splice(i,1); }
+
+      if (mode==='rhythm' && rhythmActive) rhythmTimer += dt;
+    }
+
+    // draw loop
+    function draw() {
+      // bg
+      ctx.fillStyle = '#cfefff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      if (mode==='catch') {
+        items.forEach(it=>{
+          ctx.beginPath();
+          ctx.fillStyle = TYPES[it.type].col;
+          ctx.arc(it.x, it.y, it.size, 0, Math.PI*2); ctx.fill();
+          ctx.font = `${Math.max(12,it.size/2)}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+          const label = it.type==='coin'?'🪙':(it.type==='star'?'⭐':(it.type==='bomb'?'💣':'✨'));
+          ctx.fillStyle='#183048'; ctx.fillText(label, it.x, it.y);
+        });
+      } else if (mode==='memory') {
+        drawMemory();
+      } else if (mode==='rhythm') {
+        drawRhythm();
+      }
+
+      particles.forEach(p=>{ ctx.globalAlpha = Math.max(0, p.life/30); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); ctx.globalAlpha = 1; });
+
+      // HUD hint
+      ctx.fillStyle='rgba(255,255,255,0.35)'; ctx.fillRect(8, canvas.height-46, 260, 36);
+      ctx.fillStyle='#183048'; ctx.font='14px sans-serif';
+      if(mode==='catch') ctx.fillText('Dokun / tıkla: Nesneleri yakala!', 18, canvas.height-24);
+      else if(mode==='memory') ctx.fillText('Kartları eşleştir: iki kart aç', 18, canvas.height-24);
+      else ctx.fillText('Ritim modunda: doğru zamanda tıkla', 18, canvas.height-24);
+    }
+
+    // Memory draw
+    function drawMemory() {
+      const pw = canvas.width*0.9, ph = canvas.height*0.8, sx=(canvas.width-pw)/2, sy=40;
+      const w = pw/memCols, h = ph/memRows;
+      memBoard.forEach((cell,i)=> {
+        const cx = sx + cell.x*w + w/2, cy = sy + cell.y*h + h/2;
+        ctx.fillStyle = cell.revealed ? '#ffd' : '#fff';
+        ctx.beginPath(); ctx.roundRect(cx - w/2 + 6, cy - h/2 + 6, w-12, h-12, 10); ctx.fill();
+        ctx.fillStyle = '#183048';
+        if (cell.revealed) { ctx.font='28px sans-serif'; ctx.textAlign='center'; ctx.fillText(''+cell.val, cx, cy); }
+      });
+    }
+
+    // Rhythm draw
+    function drawRhythm() {
+      const laneW = canvas.width / rhythmLanes;
+      for(let i=0;i<rhythmLanes;i++){ ctx.fillStyle = '#e6f9ff'; ctx.fillRect(i*laneW+6, 10, laneW-12, canvas.height-100); }
+      rhythmNotes.forEach(n=>{
+        const y = canvas.height - ((n.t - rhythmTimer) * 200) - 120;
+        if (y < 20 || y > canvas.height) return;
+        ctx.beginPath(); ctx.fillStyle = n.hit ? '#cfc' : '#ffd166'; ctx.arc(n.lane*laneW + laneW/2, y, 18, 0, Math.PI*2); ctx.fill();
+      });
+      ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.fillRect(0, canvas.height-140, canvas.width, 120);
+    }
+
+    // interaction handling
+    canvas.addEventListener('pointerdown', (e) => {
+      ensureAudio(); if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+      const x = (e.clientX - rect.left) * scaleX, y = (e.clientY - rect.top) * scaleY;
+      if (mode==='catch') onCatchTap(x,y);
+      else if (mode==='memory') onMemoryTap(x,y);
+      else if (mode==='rhythm') onRhythmTap(x,y);
+    });
+
+    // Catch interaction
+    function onCatchTap(x,y) {
+      let hit=false;
+      for(let i=items.length-1;i>=0;i--){
+        const it = items[i];
+        const dx = it.x - x, dy = it.y - y;
+        const dist = Math.sqrt(dx*dx+dy*dy);
+        if (dist < it.size + 18) {
+          if (it.type === 'bomb') { score = Math.max(0, score - 5); combo = 0; spawnParticles(it.x,it.y,'#ff6b6b',18); sfx(220,0.08,0.06); }
+          else { score += TYPES[it.type].score + Math.floor(combo*0.1); coins += TYPES[it.type].coin; save.coins = coins; combo++; sfx(900 - Math.min(400, combo*20),0.06,0.08); spawnParticles(it.x,it.y,TYPES[it.type].col,22); if (it.type==='rare' && Math.random() < 0.5){ coins += 10; save.coins = coins; spawnParticles(it.x,it.y,'#ffd700',32); } }
+          items.splice(i,1); hit=true;
+        }
+      }
+      if(!hit){ combo = Math.max(0, combo-1); sfx(400,0.03,0.02); }
+      updateHUD();
+    }
+
+    // Memory interaction
+    function onMemoryTap(x,y) {
+      const pw = canvas.width*0.9, ph = canvas.height*0.8, sx=(canvas.width-pw)/2, sy=40;
+      const w = pw/memCols, h = ph/memRows;
+      for (let i=0;i<memBoard.length;i++){
+        const c = memBoard[i];
+        const cx = sx + c.x*w + w/2, cy = sy + c.y*h + h/2;
+        if (x > cx - w/2 && x < cx + w/2 && y > cy - h/2 && y < cy + h/2 && !c.revealed) {
+          c.revealed = true; memRevealed.push(i);
+          if (memRevealed.length === 2) {
+            const a = memBoard[memRevealed[0]], b = memBoard[memRevealed[1]];
+            if (a.val === b.val) { score += 5; coins += 2; save.coins = coins; memPairs++; sfx(900,0.06); memRevealed=[]; }
+            else { setTimeout(()=>{ a.revealed=false; b.revealed=false; memRevealed=[]; }, 700); sfx(300,0.06); }
+          }
+          updateHUD(); break;
+        }
+      }
+    }
+
+    // Rhythm interaction
+    function onRhythmTap(x,y) {
+      const laneW = canvas.width / rhythmLanes; const lane = Math.floor(x / laneW);
+      let best = null; let bestDt = 1.0;
+      rhythmNotes.forEach(n => { if (!n.hit && n.lane === lane) { const dt = Math.abs(n.t - rhythmTimer); if (dt < bestDt) { best = n; bestDt = dt; } } });
+      if (best && bestDt < 0.4) { best.hit = true; rhythmScore += Math.max(1, Math.floor((0.4 - bestDt)*10)); score += 2; coins += 1; save.coins = coins; sfx(1000 - bestDt*300,0.04); updateHUD(); }
+      else { sfx(350,0.04); score = Math.max(0, score-1); updateHUD(); }
+    }
+
+    // HUD
+    function updateHUD(){ scoreEl.textContent = 'Skor: ' + score; coinsEl.textContent = 'Coin: ' + coins; }
+
+    // Store panel
+    storeBtn.addEventListener('click', ()=> openPanel('store'));
+    dailyBtn.addEventListener('click', ()=> {
+      const today = new Date().toISOString().slice(0,10);
+      if (save.lastDaily === today) { alert('Bugün ödülünü zaten aldın.'); return; }
+      const yesterday = new Date(Date.now()-86400000).toISOString().slice(0,10);
+      if (save.lastDaily === yesterday) save.streak = (save.streak||0)+1; else save.streak = 1;
+      save.lastDaily = today;
+      const reward = 10 + Math.min(50, save.streak*5);
+      coins += reward; save.coins = coins; saveNow();
+      spawnParticles(canvas.width/2,200,'#ffd166',48);
+      alert('Günlük ödül: ' + reward + ' coin! Streak: ' + save.streak);
+      updateHUD();
+    });
+
+    function openPanel(which){
+      overlay.classList.remove('hidden'); panel.classList.remove('hidden');
+      panelContent.innerHTML = '';
+      if (which==='store') {
+        const catalog = [{id:'pink_hat',name:'Pembe Şapka',price:50},{id:'sunglasses',name:'Gözlük',price:120},{id:'rocket',name:'Roket Parça',price:300}];
+        catalog.forEach(it=>{
+          const div = document.createElement('div'); div.style.display='flex'; div.style.justifyContent='space-between'; div.style.padding='8px 0'; div.style.borderBottom='1px dashed #eee';
+          div.innerHTML = `<div><strong>${it.name}</strong><div class="small">Fiyat: ${it.price} coin</div></div>`;
+          const btn = document.createElement('button'); btn.textContent = save.purchased && save.purchased.includes(it.id)? 'Sahip' : 'Satın Al'; btn.disabled = save.purchased && save.purchased.includes(it.id);
+          btn.addEventListener('click', ()=> { if (coins >= it.price) { coins -= it.price; save.coins = coins; save.purchased = save.purchased || []; save.purchased.push(it.id); saveNow(); btn.textContent='Sahip'; btn.disabled=true; spawnParticles(240,200,'#9b5cff',36); sfx(1200,0.08); updateHUD(); } else alert('Yeterli coin yok!'); });
+          div.appendChild(btn); panelContent.appendChild(div);
+        });
+      }
+    }
+    function closePanelFunc(){ overlay.classList.add('hidden'); panel.classList.add('hidden'); }
+    closePanel.addEventListener('click', closePanelFunc); overlay.addEventListener('click', closePanelFunc);
+
+    // control buttons
+    startBtn.addEventListener('click', ()=> { running = !running; startBtn.textContent = running ? 'Durdur' : 'Başlat'; if (running) { if (mode==='memory') startMemory(); if (mode==='rhythm') startRhythm(); } });
+    // reset session helper
+    function resetSession(){ items = []; particles = []; score = 0; combo = 0; tick = 0; if (mode==='memory') startMemory(); updateHUD(); }
+    function stopSession(){ running = false; startBtn.textContent = 'Başlat'; }
+
+    // loop
+    function loop(ts){ if(!loop._last) loop._last = ts; const dt = Math.min(0.033, (ts - loop._last)/1000); loop._last = ts; if (running) update(dt); draw(); requestAnimationFrame(loop); }
+    requestAnimationFrame(loop);
+
+    // expose some debug
+    window._happy_all = { save, saveNow, resetSave: ()=>{ localStorage.removeItem(KEY); save = JSON.parse(JSON.stringify(defaultSave)); coins = save.coins; updateHUD(); alert('Save sıfırlandı'); } };
+
+    // ensure roundRect exists
+    if (!CanvasRenderingContext2D.prototype.roundRect) {
+      CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){ if (w<2*r) r=w/2; if (h<2*r) r=h/2; this.beginPath(); this.moveTo(x+r,y); this.arcTo(x+w,y,x+w,y+h,r); this.arcTo(x+w,y+h,x,y+h,r); this.arcTo(x,y+h,x,y,r); this.arcTo(x,y,x+w,y,r); this.closePath(); };
+    }
+
+    // Init
+    saveNow();
+    updateHUD();
+    // start in catch mode by default
+    resetSession();
+
+  })();
+  </script>
+</body>
+</html>
